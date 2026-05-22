@@ -276,20 +276,106 @@ def cmd_instruments(_: argparse.Namespace) -> None:
           suggestions=["helm-agent bars <id>                   # fetch 1-min OHLCV"])
 
 
+_INTRADAY_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240}
+_DAILY_TIMEFRAMES = {"1d": "1d", "1w": "1W", "1M": "1M"}
+
+
+def _aggregate_minute_bars(bars: list[dict], mins_per_bar: int) -> list[dict]:
+    """Roll 1-min OHLCV bars up to N-minute buckets."""
+    if mins_per_bar <= 1:
+        return bars
+    bucket_ms = mins_per_bar * 60_000
+    out: list[dict] = []
+    cur: dict | None = None
+    cur_bucket = -1
+    from datetime import datetime as _dt
+    for b in bars:
+        bts_ms = int(_dt.fromisoformat(b["ts"].replace("Z", "+00:00")).timestamp() * 1000)
+        bucket = bts_ms // bucket_ms
+        if bucket != cur_bucket:
+            if cur is not None:
+                out.append(cur)
+            cur = {**b, "ts": _dt.fromtimestamp((bucket * bucket_ms) / 1000).isoformat() + "Z"}
+            cur_bucket = bucket
+        else:
+            assert cur is not None
+            cur["high"] = max(cur["high"], b["high"])
+            cur["low"] = min(cur["low"], b["low"])
+            cur["close"] = b["close"]
+            cur["volume"] += b["volume"]
+    if cur is not None:
+        out.append(cur)
+    return out
+
+
 def cmd_bars(args: argparse.Namespace) -> None:
-    bars = _request("GET", f"/api/trading/bars?instrument={args.instrument}&count={args.count}") or []
+    """Fetch OHLCV bars at any timeframe.
+
+    1m through 4h: aggregate from Nautilus' cached 1-min bars (live + recent).
+    1d, 1w, 1M:   pull from OpenBB historical (yfinance/fmp/polygon).
+    """
+    tf = args.timeframe
+    instr = args.instrument
+
+    if tf in _INTRADAY_MINUTES:
+        # Ask for enough 1-min bars to fill `count` aggregated bars.
+        raw_count = min(500, args.count * _INTRADAY_MINUTES[tf])
+        raw = _request("GET", f"/api/trading/bars?instrument={instr}&count={raw_count}") or []
+        bars = _aggregate_minute_bars(raw, _INTRADAY_MINUTES[tf])[-args.count:]
+        source = "nautilus-cache"
+
+    elif tf in _DAILY_TIMEFRAMES:
+        from datetime import date, timedelta
+        # ~count + slack to cover weekends + holidays.
+        days_back = max(args.count * (7 if tf == "1w" else 1) * 2, 30)
+        end = date.today()
+        start = end - timedelta(days=days_back)
+        ob = _request("POST", "/api/agent/openbb", json={
+            "path": "/api/v1/equity/price/historical",
+            "params": {
+                "symbol": instr.split(".")[0],
+                "provider": args.provider,
+                "interval": _DAILY_TIMEFRAMES[tf],
+                "start_date": start.isoformat(),
+                "end_date": end.isoformat(),
+            },
+        }) or {}
+        rows = (ob.get("results") if isinstance(ob, dict) else None) or []
+        # Normalize to the same {ts, open, high, low, close, volume} shape
+        # the intraday path uses, so downstream rendering stays uniform.
+        bars = [
+            {
+                "ts": (r.get("date") or "") + ("T00:00:00Z" if "T" not in (r.get("date") or "") else ""),
+                "open": r["open"], "high": r["high"], "low": r["low"],
+                "close": r["close"], "volume": r.get("volume") or 0,
+            }
+            for r in rows
+            if all(k in r for k in ("open", "high", "low", "close"))
+        ][-args.count:]
+        source = f"openbb:{args.provider}"
+
+    else:
+        _emit({"error": f"unknown --timeframe {tf!r}",
+               "help": "supported: " + ", ".join(list(_INTRADAY_MINUTES) + list(_DAILY_TIMEFRAMES))})
+        sys.exit(2)
+
     if not bars:
-        _emit({"instrument": args.instrument, "bars_count": 0,
-               "note": "no bars cached for this instrument"},
-              suggestions=[f"helm-agent instruments                 # see loaded instruments"])
+        _emit({"instrument": instr, "timeframe": tf, "bars_count": 0,
+               "source": source,
+               "note": "no bars returned — for intraday try after market open; for "
+                       "daily/weekly check that OpenBB is reachable and the symbol is valid"},
+              suggestions=["helm-agent status                      # check openbb_reachable",
+                           "helm-agent instruments                 # confirm loaded instruments"])
         return
-    rows = [{"ts": b["ts"][11:19], "o": b["open"], "h": b["high"],
+
+    rows = [{"ts": b["ts"][:19].replace("T", " "), "o": b["open"], "h": b["high"],
              "l": b["low"], "c": b["close"], "v": b["volume"]} for b in bars]
-    _emit({"instrument": args.instrument,
-           "bars_count": len(rows),
-           "from": bars[0]["ts"][:19],
-           "to": bars[-1]["ts"][:19],
-           "bars": rows})
+    _emit({
+        "instrument": instr, "timeframe": tf, "source": source,
+        "bars_count": len(rows),
+        "from": bars[0]["ts"][:19], "to": bars[-1]["ts"][:19],
+        "bars": rows,
+    })
 
 
 def cmd_decisions(args: argparse.Namespace) -> None:
@@ -940,8 +1026,27 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("accounts", help="broker accounts (balances)").set_defaults(fn=cmd_accounts)
     sub.add_parser("portfolio", help="equity, exposure, positions snapshot").set_defaults(fn=cmd_portfolio)
     sub.add_parser("instruments", help="instruments currently loaded by the engine").set_defaults(fn=cmd_instruments)
-    sp = sub.add_parser("bars", help="1-min OHLCV for one instrument")
-    sp.add_argument("instrument"); sp.add_argument("--count", type=int, default=100); sp.set_defaults(fn=cmd_bars)
+    sp = sub.add_parser(
+        "bars",
+        help="OHLCV bars at any timeframe (1m..4h via Nautilus cache; 1d/1w/1M via OpenBB)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "Fetch bars for an instrument at one of these timeframes:\n"
+            "  1m, 5m, 15m, 30m, 1h, 4h   → aggregated from the Nautilus 1-min cache\n"
+            "  1d                          → daily, via OpenBB /equity/price/historical\n"
+            "  1w                          → weekly, via OpenBB\n"
+            "  1M                          → monthly, via OpenBB\n"
+        ),
+    )
+    sp.add_argument("instrument")
+    sp.add_argument("--count", type=int, default=100,
+                    help="how many bars to return at the chosen timeframe (default 100)")
+    sp.add_argument("--timeframe", "-t", default="1m",
+                    choices=list(_INTRADAY_MINUTES) + list(_DAILY_TIMEFRAMES),
+                    help="bar size (default 1m)")
+    sp.add_argument("--provider", default="yfinance",
+                    help="OpenBB provider for daily/weekly (default yfinance)")
+    sp.set_defaults(fn=cmd_bars)
     sp = sub.add_parser("decisions", help="recent AI decisions (newest first)")
     sp.add_argument("--limit", type=int, default=20); sp.set_defaults(fn=cmd_decisions)
     sub.add_parser("feeds", help="list available exotic feed sources").set_defaults(fn=cmd_feeds)
